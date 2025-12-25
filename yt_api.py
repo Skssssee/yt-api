@@ -1,158 +1,75 @@
-import asyncio
-import json
-import time
-import os
 
 from fastapi import FastAPI, HTTPException
 import yt_dlp
-import redis
+import time
 import psutil
-
-# ================= CONFIG =================
-
-COOKIE_FILE = "/root/cookies.txt"     # VPS ONLY
-MAX_CONCURRENT = 20                   # 4GB RAM safe
-AUDIO_CACHE_TTL = 3600                # 1 hour
-VIDEO_CACHE_TTL = 1800                # 30 min
-
-START_TIME = time.time()
-
-# =========================================
+import asyncio
 
 app = FastAPI()
+START_TIME = time.time()
+SEM = asyncio.Semaphore(20)
+COOKIE_FILE = "/root/cookies.txt"
 
-# Redis
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-
-# Concurrency control
-sem = asyncio.Semaphore(MAX_CONCURRENT)
-
-BASE_OPTS = {
-    "quiet": True,
-    "cookiefile": COOKIE_FILE,
-    "geo_bypass": True,
-    "nocheckcertificate": True,
-    "socket_timeout": 10,
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-}
-
-# ================= UTIL =================
-
-def extract_info(url, opts):
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-# ================= ROUTES =================
 
 @app.get("/ping")
-async def ping():
-    return {
-        "status": "online",
-        "audio": True,
-        "video": True,
-        "concurrent_limit": MAX_CONCURRENT,
-        "uptime_sec": int(time.time() - START_TIME)
-    }
+def ping():
+    return {"status": "ok"}
+
 
 @app.get("/stats")
-async def stats():
-    mem = psutil.virtual_memory()
-    cpu = psutil.cpu_percent(interval=0.5)
-
+def stats():
     return {
         "status": "online",
         "uptime_sec": int(time.time() - START_TIME),
-        "cpu_percent": cpu,
-        "ram_total_mb": int(mem.total / 1024 / 1024),
-        "ram_used_mb": int(mem.used / 1024 / 1024),
-        "ram_free_mb": int(mem.available / 1024 / 1024),
-        "concurrent_limit": MAX_CONCURRENT,
-        "pid": os.getpid()
+        "cpu_percent": psutil.cpu_percent(),
+        "ram_total_mb": round(psutil.virtual_memory().total / 1024 / 1024),
+        "ram_used_mb": round(psutil.virtual_memory().used / 1024 / 1024),
+        "ram_free_mb": round(psutil.virtual_memory().available / 1024 / 1024),
+        "concurrent_limit": 20,
+        "pid": psutil.Process().pid
     }
 
-# ---------------- AUDIO ----------------
 
 @app.get("/audio")
 async def audio(url: str):
-    if not url:
-        raise HTTPException(status_code=400, detail="URL missing")
-
-    key = f"AUDIO:{url}"
-    cached = r.get(key)
-    if cached:
-        data = json.loads(cached)
-        data["cached"] = True
-        return data
-
-    async with sem:
+    async with SEM:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "noplaylist": True,
+            "cookies": COOKIE_FILE
+        }
         try:
-            opts = BASE_OPTS | {"format": "bestaudio/best"}
-            info = extract_info(url, opts)
-
-            data = {
-                "type": "audio",
-                "title": info.get("title"),
-                "duration": info.get("duration"),
-                "audio_url": info.get("url"),
-                "cached": False
-            }
-
-            r.setex(key, AUDIO_CACHE_TTL, json.dumps(data))
-            return data
-
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return {"audio_url": info["url"]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-# ---------------- VIDEO ----------------
 
 @app.get("/video")
-async def video(url: str, quality: str = "720"):
-    if not url:
-        raise HTTPException(status_code=400, detail="URL missing")
-
-    key = f"VIDEO:{url}:{quality}"
-    cached = r.get(key)
-    if cached:
-        data = json.loads(cached)
-        data["cached"] = True
-        return data
-
-    async with sem:
+async def video(url: str, quality: int = 720):
+    async with SEM:
+        ydl_opts = {
+            "format": f"bestvideo[height<={quality}]/best",
+            "quiet": True,
+            "noplaylist": True,
+            "cookies": COOKIE_FILE
+        }
         try:
-            if quality == "1080":
-                fmt = "bestvideo[height<=1080]+bestaudio/best"
-            elif quality == "480":
-                fmt = "bestvideo[height<=480]+bestaudio/best"
-            else:
-                fmt = "bestvideo[height<=720]+bestaudio/best"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-            opts = BASE_OPTS | {
-                "format": fmt,
-                "merge_output_format": "mp4"
-            }
+                # direct stream
+                if "url" in info:
+                    return {"video_url": info["url"]}
 
-            info = extract_info(url, opts)
+                # fallback
+                for f in info.get("formats", []):
+                    if f.get("url"):
+                        return {"video_url": f["url"]}
 
-            video_url = None
-            for f in info.get("formats", []):
-                if f.get("vcodec") != "none" and f.get("acodec") != "none":
-                    video_url = f.get("url")
-                    break
-
-            if not video_url:
-                raise Exception("No video stream found")
-
-            data = {
-                "type": "video",
-                "title": info.get("title"),
-                "duration": info.get("duration"),
-                "quality": quality,
-                "video_url": video_url,
-                "cached": False
-            }
-
-            r.setex(key, VIDEO_CACHE_TTL, json.dumps(data))
-            return data
+                raise Exception("No playable format found")
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
