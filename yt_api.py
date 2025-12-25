@@ -1,109 +1,91 @@
-import asyncio
-import yt_dlp
+
+import os
+import subprocess
+import tempfile
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+import yt_dlp
 
-app = FastAPI(title="YT Audio + Video API")
+app = FastAPI()
 
-# =========================
-# yt-dlp BASE OPTIONS
-# =========================
-BASE_OPTS = {
+# ---------------------------------------------------
+# yt-dlp SAFE OPTIONS (AUTO FORMAT)
+# ---------------------------------------------------
+YTDLP_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    "skip_download": True,
-    "nocheckcertificate": True,
+    "noplaylist": True,
+    "format": "bestaudio/best",
     "geo_bypass": True,
-    "cookiefile": "cookies.txt",
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android"],
-        }
-    },
+    "nocheckcertificate": True,
 }
 
-# =========================
-# AUDIO (NO VIDEO)
-# =========================
-AUDIO_OPTS = {
-    **BASE_OPTS,
-    "format": "bestaudio[ext=m4a]/bestaudio",
-}
-
-# =========================
-# VIDEO (VIDEO + AUDIO)
-# =========================
-VIDEO_OPTS = {
-    **BASE_OPTS,
-    # progressive mp4 (video+audio together)
-    "format": "best[ext=mp4]/best",
-}
+# Optional cookies (recommended)
+COOKIES_PATH = "cookies.txt"
+if os.path.exists(COOKIES_PATH):
+    YTDLP_OPTS["cookiefile"] = COOKIES_PATH
 
 
-# =========================
-# HELPERS
-# =========================
-def extract_audio(url: str):
-    with yt_dlp.YoutubeDL(AUDIO_OPTS) as ydl:
+# ---------------------------------------------------
+# Extract audio URL safely
+# ---------------------------------------------------
+def extract_audio_url(url: str) -> str:
+    with yt_dlp.YoutubeDL(YTDLP_OPTS) as ydl:
         info = ydl.extract_info(url, download=False)
 
+        # LIVE or HLS
+        if "url" in info:
+            return info["url"]
+
+        # NORMAL VIDEO
         for f in info.get("formats", []):
-            if (
-                f.get("acodec") != "none"
-                and f.get("vcodec") == "none"
-                and f.get("url")
-            ):
+            if f.get("acodec") != "none" and f.get("vcodec") == "none":
                 return f["url"]
 
-        raise Exception("No audio-only format found")
+        raise Exception("No audio stream found")
 
 
-def extract_video(url: str):
-    with yt_dlp.YoutubeDL(VIDEO_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-        for f in info.get("formats", []):
-            if (
-                f.get("acodec") != "none"
-                and f.get("vcodec") != "none"
-                and f.get("ext") == "mp4"
-                and f.get("url")
-            ):
-                return f["url"]
-
-        raise Exception("No progressive video found")
-
-
-# =========================
-# API ENDPOINTS
-# =========================
+# ---------------------------------------------------
+# /audio endpoint
+# ---------------------------------------------------
 @app.get("/audio")
 async def audio(url: str = Query(...)):
     try:
-        audio_url = await asyncio.to_thread(extract_audio, url)
+        audio_url = extract_audio_url(url)
         return {
             "status": "ok",
-            "type": "audio",
-            "audio_url": audio_url,
+            "audio_url": audio_url
         }
     except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "detail": str(e)},
+            status_code=400,
+            content={
+                "status": "error",
+                "detail": str(e)
+            }
         )
 
 
+# ---------------------------------------------------
+# /video endpoint (OPTIONAL)
+# ---------------------------------------------------
 @app.get("/video")
 async def video(url: str = Query(...)):
     try:
-        video_url = await asyncio.to_thread(extract_video, url)
-        return {
-            "status": "ok",
-            "type": "video",
-            "video_url": video_url,
-        }
+        opts = YTDLP_OPTS.copy()
+        opts["format"] = "best"
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "status": "ok",
+                "video_url": info["url"]
+            }
     except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "detail": str(e)},
-            )
+            status_code=400,
+            content={
+                "status": "error",
+                "detail": str(e)
+            }
+        )
